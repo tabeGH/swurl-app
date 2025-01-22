@@ -1,125 +1,292 @@
+import 'dart:async';
+import 'dart:collection';
+import 'dart:io';
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:video_player/video_player.dart';
+import 'package:ffmpeg_kit_flutter/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter/return_code.dart';
 
-void main() {
-  runApp(const MyApp());
+void main() async {
+  // Ensure Flutter bindings are initialized
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize cameras before running app
+  final cameras = await availableCameras();
+  if (cameras.isEmpty) {
+    print('No cameras found');
+    return;
+  }
+
+  runApp(CameraApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
-
-  // This widget is the root of your application.
+class CameraApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Continuous Camera Recording',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.redAccent),
-        useMaterial3: true,
+        primarySwatch: Colors.blue,
+        brightness: Brightness.light,
       ),
-      home: const MyHomePage(title: 'Project Swurl'),
+      darkTheme: ThemeData(
+        brightness: Brightness.dark,
+      ),
+      home: const CameraScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class CameraScreen extends StatelessWidget {
+  const CameraScreen({Key? key}) : super(key: key);
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Camera Recording'),
+      ),
+      body: const SafeArea(
+        child: ContinuousRecording(
+          bufferDurationSeconds: 30, // Customize buffer duration here
+        ),
+      ),
+    );
+  }
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+// Rest of the ContinuousRecording class implementation remains the same
+class ContinuousRecording extends StatefulWidget {
+  final int bufferDurationSeconds;
 
-  void _incrementCounter() {
+  const ContinuousRecording({
+    Key? key,
+    this.bufferDurationSeconds = 30,
+  }) : super(key: key);
+
+  @override
+  State<ContinuousRecording> createState() => _ContinuousRecordingState();
+}
+
+class _ContinuousRecordingState extends State<ContinuousRecording> {
+  CameraController? _controller;
+  Queue<File> _videoSegments = Queue();
+  Timer? _recordingTimer;
+  bool _isRecording = false;
+  bool _isSaving = false;
+  int _currentSegmentDuration = 5;
+  VideoPlayerController? _previewController;
+  String? _lastSavedVideoPath;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeCamera();
+  }
+
+  Future<void> _initializeCamera() async {
+    final cameras = await availableCameras();
+    final firstCamera = cameras.first;
+
+    _controller = CameraController(
+      firstCamera,
+      ResolutionPreset.medium,
+      enableAudio: true,
+    );
+
+    await _controller!.initialize();
+    if (mounted) {
+      setState(() {});
+      _startRecording();
+    }
+  }
+
+  Future<void> _startRecording() async {
+    if (!_controller!.value.isInitialized) return;
+
+    _isRecording = true;
+    await _recordSegment();
+
+    _recordingTimer = Timer.periodic(
+      Duration(seconds: _currentSegmentDuration),
+          (_) => _recordSegment(),
+    );
+  }
+
+  Future<void> _recordSegment() async {
+    if (!_isRecording) return;
+
+    final Directory tempDir = await getTemporaryDirectory();
+    final String filePath = '${tempDir.path}/segment_${DateTime.now().millisecondsSinceEpoch}.mp4';
+
+    try {
+      await _controller!.startVideoRecording();
+      await Future.delayed(Duration(seconds: _currentSegmentDuration));
+      final XFile videoFile = await _controller!.stopVideoRecording();
+
+      _videoSegments.add(File(videoFile.path));
+
+      while (_videoSegments.length * _currentSegmentDuration > widget.bufferDurationSeconds) {
+        final File oldFile = _videoSegments.removeFirst();
+        await oldFile.delete();
+      }
+    } catch (e) {
+      print('Error recording segment: $e');
+    }
+  }
+
+  Future<String?> saveLastSeconds() async {
+    if (_videoSegments.isEmpty) return null;
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isRecording = false;
+      _isSaving = true;
     });
+
+    _recordingTimer?.cancel();
+
+    try {
+      final Directory appDir = await getApplicationDocumentsDirectory();
+      final String outputPath = '${appDir.path}/saved_recording_${DateTime.now().millisecondsSinceEpoch}.mp4';
+      final String concatFilePath = '${appDir.path}/concat_list.txt';
+
+      // Create a concat demuxer file for FFmpeg
+      final StringBuffer concatBuffer = StringBuffer();
+      for (final File segment in _videoSegments) {
+        concatBuffer.writeln("file '${segment.path}'");
+      }
+      await File(concatFilePath).writeAsString(concatBuffer.toString());
+
+      // Use FFmpeg to concatenate videos
+      final session = await FFmpegKit.execute(
+          '-f concat -safe 0 -i "$concatFilePath" -c copy "$outputPath"'
+      );
+
+      final ReturnCode? returnCode = await session.getReturnCode();
+
+      if (ReturnCode.isSuccess(returnCode)) {
+        _lastSavedVideoPath = outputPath;
+        await _initializePreviewPlayer(outputPath);
+        return outputPath;
+      } else {
+        print('FFmpeg process exited with error');
+        return null;
+      }
+    } catch (e) {
+      print('Error saving video: $e');
+      return null;
+    } finally {
+      setState(() {
+        _isSaving = false;
+      });
+      _startRecording();
+    }
+  }
+
+  Future<void> _initializePreviewPlayer(String videoPath) async {
+    _previewController?.dispose();
+    _previewController = VideoPlayerController.file(File(videoPath));
+
+    await _previewController!.initialize();
+    setState(() {});
+  }
+
+  Widget _buildPreviewSection() {
+    if (_previewController == null || !_previewController!.value.isInitialized) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      height: 200,
+      child: Column(
+        children: [
+          Expanded(
+            child: AspectRatio(
+              aspectRatio: _previewController!.value.aspectRatio,
+              child: VideoPlayer(_previewController!),
+            ),
+          ),
+          VideoProgressIndicator(_previewController!, allowScrubbing: true),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              IconButton(
+                icon: Icon(
+                  _previewController!.value.isPlaying
+                      ? Icons.pause
+                      : Icons.play_arrow,
+                ),
+                onPressed: () {
+                  setState(() {
+                    _previewController!.value.isPlaying
+                        ? _previewController!.pause()
+                        : _previewController!.play();
+                  });
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.replay),
+                onPressed: () {
+                  _previewController!.seekTo(Duration.zero);
+                  _previewController!.play();
+                },
+              ),
+              if (_lastSavedVideoPath != null)
+                IconButton(
+                  icon: const Icon(Icons.share),
+                  onPressed: () {
+                    // Implement sharing functionality here
+                    // You could use share_plus package
+                  },
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
-    return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text(
-              'You have pushed the button this many times:',
-            ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-          ],
+    if (_controller == null || !_controller!.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Column(
+      children: [
+        Expanded(
+          child: CameraPreview(_controller!),
         ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+        _buildPreviewSection(),
+        Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: ElevatedButton(
+            onPressed: _isSaving
+                ? null
+                : () async {
+              final String? savedPath = await saveLastSeconds();
+              if (savedPath != null) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Video saved to: $savedPath')),
+                );
+              }
+            },
+            child: _isSaving
+                ? const CircularProgressIndicator()
+                : Text('Save Last ${widget.bufferDurationSeconds} Seconds'),
+          ),
+        ),
+      ],
     );
+  }
+
+  @override
+  void dispose() {
+    _recordingTimer?.cancel();
+    _controller?.dispose();
+    _previewController?.dispose();
+    super.dispose();
   }
 }
